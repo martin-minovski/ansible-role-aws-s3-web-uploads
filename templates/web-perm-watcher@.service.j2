@@ -1,0 +1,21 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Real-time perm-watcher for %i web dir (supplements s3-uploads-sync)
+After=network-online.target s3-uploads-sync@%i.service
+
+[Service]
+Type=simple
+ExecStart={{ bin_dir }}/web-perm-watcher.sh "{{ web_dir }}" "{{ web_group }}" "{{ web_group }}"
+Restart=always
+RestartSec=3
+MemoryMax=128M
+CPUWeight=30
+Nice=10
+
+ProtectSystem=strict
+ReadWritePaths={{ web_dir }}
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

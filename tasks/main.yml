@@ -1,0 +1,102 @@
+---
+# Drives two systemd services:
+#   * s3-uploads-sync@{{ fqdn }}.service   - long-polls SQS, mirrors S3 objects
+#   * web-perm-watcher@{{ fqdn }}.service  - inotify, enforces web_group perms
+#
+# Pre-req: the EC2 instance role must grant SQS, S3, and KMS permissions.
+
+- name: Uploads | Install runtime deps
+  ansible.builtin.apt:
+    name:
+      - awscli
+      - inotify-tools
+      - jq
+    state: present
+    update_cache: true
+
+- name: Uploads | Raise inotify watch limit for large web trees
+  ansible.posix.sysctl:
+    name: fs.inotify.max_user_watches
+    value: "524288"
+    state: present
+    reload: true
+
+- name: Uploads | Ensure web root exists with SGID + web group
+  ansible.builtin.file:
+    path: "{{ web_dir }}"
+    state: directory
+    owner: "{{ web_group }}"
+    group: "{{ web_group }}"
+    mode: '2775'
+
+- name: Uploads | Deploy S3->disk sync daemon
+  ansible.builtin.template:
+    src: s3-uploads-sync.sh.j2
+    dest: "{{ bin_dir }}/s3-uploads-sync.sh"
+    owner: root
+    group: root
+    mode: '0750'
+  notify: Uploads | Restart sync daemon
+
+- name: Uploads | Deploy permission watcher daemon
+  ansible.builtin.template:
+    src: web-perm-watcher.sh.j2
+    dest: "{{ bin_dir }}/web-perm-watcher.sh"
+    owner: root
+    group: root
+    mode: '0750'
+  notify: Uploads | Restart perm watcher
+
+- name: Uploads | Install s3-uploads-sync systemd unit
+  ansible.builtin.template:
+    src: s3-uploads-sync@.service.j2
+    dest: "{{ systemd_unit_dir }}/s3-uploads-sync@.service"
+    owner: root
+    group: root
+    mode: '0644'
+  notify:
+    - Uploads | Reload systemd
+    - Uploads | Restart sync daemon
+
+- name: Uploads | Install web-perm-watcher systemd unit
+  ansible.builtin.template:
+    src: web-perm-watcher@.service.j2
+    dest: "{{ systemd_unit_dir }}/web-perm-watcher@.service"
+    owner: root
+    group: root
+    mode: '0644'
+  notify:
+    - Uploads | Reload systemd
+    - Uploads | Restart perm watcher
+
+- name: Uploads | Flush handlers so units exist before enable/start
+  ansible.builtin.meta: flush_handlers
+
+- name: Uploads | One-shot baseline sync from S3
+  ansible.builtin.command:
+    cmd: >-
+      aws s3 sync
+      {% for ex in sync_exclude_paths %}--exclude "{{ ex }}" {% endfor %}
+      s3://{{ uploads_bucket }}/{{ uploads_prefix }}
+      {{ web_dir }}/
+  environment:
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+  register: uploads_baseline_sync
+  changed_when: "'download:' in uploads_baseline_sync.stdout"
+  when: uploads_run_baseline_sync | bool
+
+- name: Uploads | Enable and start permission watcher
+  ansible.builtin.systemd:
+    name: "web-perm-watcher@{{ fqdn }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: uploads_manage_services | bool
+
+- name: Uploads | Enable and start S3 sync daemon
+  ansible.builtin.systemd:
+    name: "s3-uploads-sync@{{ fqdn }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: uploads_manage_services | bool

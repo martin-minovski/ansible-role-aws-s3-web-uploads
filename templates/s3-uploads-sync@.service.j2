@@ -1,0 +1,35 @@
+# {{ ansible_managed }}
+[Unit]
+Description=S3-event per-file sync of uploads -> %i web dir
+After=network-online.target amazon-ssm-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=AWS_DEFAULT_REGION={{ aws_region }}
+Environment=UPLOADS_BUCKET={{ uploads_bucket }}
+Environment=UPLOADS_PREFIX={{ uploads_prefix }}
+Environment=UPLOADS_QUEUE_URL={{ uploads_queue_url }}
+Environment=WEB_DIR={{ web_dir }}
+Environment=FILE_OWNER={{ web_group }}
+Environment=FILE_GROUP={{ web_group }}
+ExecStart={{ bin_dir }}/s3-uploads-sync.sh
+Restart=always
+RestartSec=3
+# Mostly idle; brief aws s3 cp bursts on S3 notifications.
+MemoryMax=256M
+CPUWeight=50
+Nice=10
+
+# Filesystem hardening: only the web dir is writable.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={{ web_dir }}
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

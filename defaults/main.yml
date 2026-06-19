@@ -1,0 +1,51 @@
+---
+# S3-event-driven remote upload workflow:
+#
+#   developer IDE -> aws s3 cp/sync -> S3 (per-host prefix)
+#   S3 event notification -> SQS queue
+#   on-host daemon long-polls SQS -> mirrors objects into web_dir
+#   inotify perm-watcher fixes ownership/mode for nginx/php-fpm
+#
+# IAM enforces the upload boundary: the developer policy only permits
+# operations under s3://{{ uploads_bucket }}/{{ uploads_prefix }}
+
+# Target directory the daemon syncs into. Must match the nginx root.
+web_dir: "/var/www/{{ fqdn }}"
+
+# Unix group that nginx + php-fpm run as on Debian.
+web_group: www-data
+
+# Required playbook/inventory inputs (no role defaults):
+#   uploads_bucket, uploads_queue_url, fqdn
+
+# S3 object prefix for this host (trailing slash recommended).
+uploads_prefix: "{{ fqdn }}/"
+
+aws_region: eu-west-1
+
+# Per-sync `aws s3 sync` excludes. vendor + node_modules are managed on the
+# host by composer/npm, not by IDE upload, so S3 deletions must not wipe them.
+sync_exclude_paths:
+  - vendor/*
+  - node_modules/*
+
+# Maximum number of SQS messages drained per receive call (1..10).
+sqs_batch_size: 10
+
+# Long-poll wait per receive call (0..20).
+sqs_wait_seconds: 20
+
+# Extra logging from the inotify perm-watcher daemon.
+perm_watcher_enable_logging: false
+
+# Paths excluded from chown/chmod sweeps so dependency executables keep their bits.
+perm_watcher_excludes:
+  - node_modules
+  - vendor
+
+# Where helper scripts and systemd units are installed.
+bin_dir: /usr/local/sbin
+systemd_unit_dir: /etc/systemd/system
+
+uploads_run_baseline_sync: true
+uploads_manage_services: true

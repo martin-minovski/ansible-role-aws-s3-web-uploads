@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  author: Martin Minovski
+  description: Mirror S3 uploads into a web directory via SQS-driven systemd daemons
+  license: MIT
+  min_ansible_version: "11.0.0"
+
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+
+  galaxy_tags:
+    - aws
+    - s3
+    - sqs
+    - systemd
+    - web
+
+dependencies: []

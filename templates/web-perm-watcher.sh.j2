@@ -1,0 +1,59 @@
+#!/bin/bash
+# {{ ansible_managed }}
+
+TARGET_DIR="$1"
+OWNER="$2"
+GROUP="$3"
+
+if [ -z "$TARGET_DIR" ] || [ -z "$OWNER" ] || [ -z "$GROUP" ]; then
+    echo "Usage: $0 <target_dir> <owner> <group>"
+    exit 1
+fi
+
+log() {
+{% if perm_watcher_enable_logging | bool %}
+    printf '%s [web-perm-watcher] %s\n' "$(date --iso-8601=seconds)" "$*" >&2
+{% else %}
+    :
+{% endif %}
+}
+
+# Build find(1) predicates that skip configured dependency directories.
+FIND_NAME_EXCLUDES=(
+{% for ex in perm_watcher_excludes %}
+    -not -name "{{ ex }}"
+{% endfor %}
+)
+FIND_PATH_EXCLUDES=(
+{% for ex in perm_watcher_excludes %}
+    -not -path "*/{{ ex }}/*"
+{% endfor %}
+)
+
+INOTIFY_EXCLUDE='({% for ex in perm_watcher_excludes %}/{{ ex }}/{% if not loop.last %}|{% endif %}{% endfor %})'
+
+echo "Performing baseline sweep on $TARGET_DIR..."
+find "$TARGET_DIR" -maxdepth 1 -mindepth 1 "${FIND_NAME_EXCLUDES[@]}" \
+    -exec chown -R "$OWNER:$GROUP" {} +
+
+find "$TARGET_DIR" -type d "${FIND_PATH_EXCLUDES[@]}" -exec chmod 2775 {} +
+find "$TARGET_DIR" -type f "${FIND_PATH_EXCLUDES[@]}" -exec chmod 0664 {} +
+
+echo "Baseline secure. Entering real-time watch mode..."
+log "Watching $TARGET_DIR (owner=$OWNER group=$GROUP)"
+
+inotifywait -m -r -e create,close_write,moved_to \
+    --excludei "$INOTIFY_EXCLUDE" \
+    --format '%w%f' "$TARGET_DIR" 2>/dev/null | while read -r CHANGED_PATH; do
+
+    [ ! -e "$CHANGED_PATH" ] && continue
+
+    log "Fixing permissions: $CHANGED_PATH"
+    chown "$OWNER:$GROUP" "$CHANGED_PATH"
+
+    if [ -d "$CHANGED_PATH" ]; then
+        chmod 2775 "$CHANGED_PATH"
+    elif [ -f "$CHANGED_PATH" ]; then
+        chmod 0664 "$CHANGED_PATH"
+    fi
+done

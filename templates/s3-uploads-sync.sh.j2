@@ -1,0 +1,207 @@
+#!/bin/bash
+# {{ ansible_managed }}
+#
+# S3-event-driven mirror of s3://BUCKET/PREFIX/ -> WEB_DIR.
+# Long-polls SQS for S3 ObjectCreated/ObjectRemoved notifications and
+# applies per-object changes (aws s3 cp / rm). A full-prefix sync runs
+# once at startup only (no --delete). Bursts are coalesced: one receive
+# batch -> parse all keys -> apply -> ack.
+set -eo pipefail
+
+: "${UPLOADS_BUCKET:?UPLOADS_BUCKET is required}"
+: "${UPLOADS_PREFIX:?UPLOADS_PREFIX is required}"
+: "${UPLOADS_QUEUE_URL:?UPLOADS_QUEUE_URL is required}"
+: "${WEB_DIR:?WEB_DIR is required}"
+: "${AWS_DEFAULT_REGION:?AWS_DEFAULT_REGION is required}"
+
+FILE_OWNER="${FILE_OWNER:-www-data}"
+FILE_GROUP="${FILE_GROUP:-www-data}"
+
+# Paths we never pull from S3 or delete locally (mirrors defaults/main.yml).
+SKIP_PATTERNS=(
+{% for ex in sync_exclude_paths %}
+  "{{ ex }}"
+{% endfor %}
+)
+SYNC_EXCLUDES=(
+{% for ex in sync_exclude_paths %}
+  --exclude "{{ ex }}"
+{% endfor %}
+)
+
+BATCH_SIZE="${SQS_BATCH_SIZE:-{{ sqs_batch_size }}}"
+WAIT_SECONDS="${SQS_WAIT_SECONDS:-{{ sqs_wait_seconds }}}"
+
+log() {
+  printf '%s [s3-uploads-sync] %s\n' "$(date --iso-8601=seconds)" "$*" >&2
+}
+urldecode() {
+  python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote_plus(sys.argv[1]))' "$1"
+}
+
+should_skip_key() {
+  local key="$1"
+  local rel="$2"
+  local pat
+
+  # Prefix must match our chroot
+  [[ "$key" == "${UPLOADS_PREFIX}"* ]] || return 0
+
+  for pat in "${SKIP_PATTERNS[@]}"; do
+    pat="${pat%\*}"          # "vendor/*" -> "vendor/"
+    [[ "$rel" == "$pat"* ]] && return 0
+  done
+  return 1
+}
+
+safe_local_path() {
+  local rel="$1"
+  local dest="${WEB_DIR%/}/${rel}"
+
+  # Reject traversal
+  if [[ "$rel" == *".."* ]]; then
+    return 1
+  fi
+
+  local resolved
+  resolved="$(realpath -m "$dest" 2>/dev/null)" || return 1
+  [[ "$resolved" == "${WEB_DIR%/}"* ]] || return 1
+  printf '%s\n' "$resolved"
+}
+
+fix_perms() {
+  local path="$1"
+  [[ -e "$path" ]] || return 0
+  chown "$FILE_OWNER:$FILE_GROUP" "$path"
+  if [[ -d "$path" ]]; then
+    chmod 2775 "$path"
+  else
+    chmod 0664 "$path"
+  fi
+}
+
+apply_create_or_update() {
+  local key="$1"
+  local rel="${key#${UPLOADS_PREFIX}}"
+  rel="${rel#/}"
+
+  if should_skip_key "$key" "$rel"; then
+    log "skip (excluded): s3://${UPLOADS_BUCKET}/${key}"
+    return 0
+  fi
+
+  local dest
+  dest="$(safe_local_path "$rel")" || {
+    log "skip (unsafe path): ${key}"
+    return 0
+  }
+
+  mkdir -p "$(dirname "$dest")"
+  log "copy: s3://${UPLOADS_BUCKET}/${key} -> ${dest}"
+  aws s3 cp "s3://${UPLOADS_BUCKET}/${key}" "$dest"
+  fix_perms "$dest"
+}
+
+apply_delete() {
+  local key="$1"
+  local rel="${key#${UPLOADS_PREFIX}}"
+  rel="${rel#/}"
+
+  if should_skip_key "$key" "$rel"; then
+    log "skip delete (excluded): ${key}"
+    return 0
+  fi
+
+  local dest
+  dest="$(safe_local_path "$rel")" || {
+    log "skip delete (unsafe path): ${key}"
+    return 0
+  }
+
+  if [[ -e "$dest" ]]; then
+    log "delete: ${dest}"
+    rm -f "$dest"
+  else
+    log "delete (already gone): ${dest}"
+  fi
+}
+
+run_baseline_sync() {
+  log "Baseline sync (no --delete): s3://${UPLOADS_BUCKET}/${UPLOADS_PREFIX} -> ${WEB_DIR}"
+  aws s3 sync "${SYNC_EXCLUDES[@]}" \
+    "s3://${UPLOADS_BUCKET}/${UPLOADS_PREFIX}" \
+    "${WEB_DIR}/" 2>&1 | sed 's/^/  /' || return 1
+
+  # Ensure baseline tree ownership (perm-watcher may still be starting)
+  find "$WEB_DIR" -not -path '*/node_modules/*' -not -path '*/vendor/*' \
+    -exec chown "$FILE_OWNER:$FILE_GROUP" {} + 2>/dev/null || true
+}
+
+drain_queue() {
+  local resp
+  resp="$(aws sqs receive-message \
+    --queue-url "${UPLOADS_QUEUE_URL}" \
+    --max-number-of-messages "${BATCH_SIZE}" \
+    --wait-time-seconds "${WAIT_SECONDS}" \
+    --visibility-timeout 120 \
+    --output json 2>/dev/null || true)"
+
+  [[ -n "$resp" && "$(jq -r '.Messages | length // 0' <<< "$resp")" -gt 0 ]] || return 1
+
+  # Apply deletes after creates when both appear in one batch for the same key
+  local -a handles=()
+  local -a bodies=()
+  local msg body handle
+
+  while IFS= read -r handle; do
+    handles+=("$handle")
+  done < <(jq -r '.Messages[]?.ReceiptHandle' <<< "$resp")
+
+  while IFS= read -r body; do
+    bodies+=("$body")
+  done < <(jq -r '.Messages[]?.Body' <<< "$resp")
+
+  # Pass 1: creates/updates
+  for body in "${bodies[@]}"; do
+    while IFS=$'\t' read -r event key; do
+      [[ -n "$key" ]] || continue
+      key="$(urldecode "$key")"
+      [[ "$event" == ObjectCreated:* ]] && apply_create_or_update "$key"
+    done < <(jq -r '.Records[]? | [.eventName, .s3.object.key] | @tsv' <<< "$body" 2>/dev/null)
+  done
+
+  # Pass 2: deletes
+  for body in "${bodies[@]}"; do
+    while IFS=$'\t' read -r event key; do
+      [[ -n "$key" ]] || continue
+      key="$(urldecode "$key")"
+      [[ "$event" == ObjectRemoved:* ]] && apply_delete "$key"
+    done < <(jq -r '.Records[]? | [.eventName, .s3.object.key] | @tsv' <<< "$body" 2>/dev/null)
+  done
+
+  # Ack the whole batch
+  local entries='[]' idx=0
+  for handle in "${handles[@]}"; do
+    entries="$(jq --arg id "msg-${idx}" --arg rh "$handle" \
+      '. + [{Id: $id, ReceiptHandle: $rh}]' <<< "$entries")"
+    idx=$((idx + 1))
+  done
+
+  aws sqs delete-message-batch \
+    --queue-url "${UPLOADS_QUEUE_URL}" \
+    --entries "$entries" >/dev/null
+
+  log "Acked ${idx} SQS message(s)"
+  return 0
+}
+
+log "Starting daemon: bucket=${UPLOADS_BUCKET} prefix=${UPLOADS_PREFIX} queue=${UPLOADS_QUEUE_URL} web_dir=${WEB_DIR}"
+log "Performing startup baseline sync"
+run_baseline_sync || log "Baseline sync failed (continuing)"
+
+while true; do
+  if ! drain_queue; then
+    # No messages within the long-poll window; just loop again.
+    continue
+  fi
+done
