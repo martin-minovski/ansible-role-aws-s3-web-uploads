@@ -1,7 +1,7 @@
 ---
 # Drives two systemd services:
-#   * s3-uploads-sync@{{ fqdn }}.service   - long-polls SQS, mirrors S3 objects
 #   * web-perm-watcher@{{ fqdn }}.service  - inotify, enforces web_group perms
+#   * s3-uploads-sync@{{ fqdn }}.service   - long-polls SQS, mirrors S3 objects
 #
 # Pre-req: the EC2 instance role must grant SQS, S3, and KMS permissions.
 
@@ -28,6 +28,23 @@
     owner: "{{ web_group }}"
     group: "{{ web_group }}"
     mode: '2775'
+
+- name: Uploads | Resolve canonical web_dir for systemd ReadWritePaths
+  ansible.builtin.command:
+    cmd: readlink -f -- "{{ web_dir }}"
+  register: uploads_web_dir_canonical
+  changed_when: false
+
+- name: Uploads | Build ReadWritePaths list for systemd sandbox
+  ansible.builtin.set_fact:
+    web_dir_readwrite_paths: >-
+      {{
+        [web_dir, uploads_web_dir_canonical.stdout]
+        | map('regex_replace', '/+$', '')
+        | unique
+        | list
+        | join(' ')
+      }}
 
 - name: Uploads | Deploy S3->disk sync daemon
   ansible.builtin.template:
@@ -72,31 +89,31 @@
 - name: Uploads | Flush handlers so units exist before enable/start
   ansible.builtin.meta: flush_handlers
 
-- name: Uploads | One-shot baseline sync from S3
+- name: Uploads | Clean up S3 webdir
   ansible.builtin.command:
     cmd: >-
-      aws s3 sync
-      {% for ex in sync_exclude_paths %}--exclude "{{ ex }}" {% endfor %}
+      aws s3 rm
       s3://{{ uploads_bucket }}/{{ uploads_prefix }}
-      {{ web_dir }}/
+      --recursive
   environment:
     AWS_DEFAULT_REGION: "{{ aws_region }}"
-  register: uploads_baseline_sync
-  changed_when: "'download:' in uploads_baseline_sync.stdout"
-  when: uploads_run_baseline_sync | bool
+  register: uploads_delete_dir
+  changed_when: "'delete:' in uploads_delete_dir.stdout"
 
-- name: Uploads | Enable and start permission watcher
+# Always restart on role run: web_dir is often replaced (git clone) while units
+# stay up, leaving stale ReadWritePaths / inotify watches on the old tree.
+- name: Uploads | Enable and restart permission watcher
   ansible.builtin.systemd:
     name: "web-perm-watcher@{{ fqdn }}"
-    state: started
+    state: restarted
     enabled: true
     daemon_reload: true
   when: uploads_manage_services | bool
 
-- name: Uploads | Enable and start S3 sync daemon
+- name: Uploads | Enable and restart S3 sync daemon
   ansible.builtin.systemd:
     name: "s3-uploads-sync@{{ fqdn }}"
-    state: started
+    state: restarted
     enabled: true
     daemon_reload: true
   when: uploads_manage_services | bool

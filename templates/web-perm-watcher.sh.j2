@@ -19,25 +19,37 @@ log() {
 }
 
 # Build find(1) predicates that skip configured dependency directories.
-FIND_NAME_EXCLUDES=(
-{% for ex in perm_watcher_excludes %}
-    -not -name "{{ ex }}"
-{% endfor %}
-)
 FIND_PATH_EXCLUDES=(
 {% for ex in perm_watcher_excludes %}
+    -not -path "*/{{ ex }}"
     -not -path "*/{{ ex }}/*"
 {% endfor %}
 )
 
 INOTIFY_EXCLUDE='({% for ex in perm_watcher_excludes %}/{{ ex }}/{% if not loop.last %}|{% endif %}{% endfor %})'
 
-echo "Performing baseline sweep on $TARGET_DIR..."
-find "$TARGET_DIR" -maxdepth 1 -mindepth 1 "${FIND_NAME_EXCLUDES[@]}" \
-    -exec chown -R "$OWNER:$GROUP" {} +
+fix_path_perms() {
+    local path="$1"
 
-find "$TARGET_DIR" -type d "${FIND_PATH_EXCLUDES[@]}" -exec chmod 2775 {} +
-find "$TARGET_DIR" -type f "${FIND_PATH_EXCLUDES[@]}" -exec chmod 0664 {} +
+    [ ! -e "$path" ] && return 0
+
+    chown "$OWNER:$GROUP" "$path" 2>/dev/null || {
+        log "skip chown (read-only?): $path"
+        return 0
+    }
+
+    if [ -d "$path" ]; then
+        chmod 2775 "$path" 2>/dev/null || log "skip chmod (read-only?): $path"
+    elif [ -f "$path" ]; then
+        chmod 0664 "$path" 2>/dev/null || log "skip chmod (read-only?): $path"
+    fi
+}
+
+echo "Performing baseline sweep on $TARGET_DIR..."
+find "$TARGET_DIR" "${FIND_PATH_EXCLUDES[@]}" -print0 |
+while IFS= read -r -d '' path; do
+    fix_path_perms "$path"
+done
 
 echo "Baseline secure. Entering real-time watch mode..."
 log "Watching $TARGET_DIR (owner=$OWNER group=$GROUP)"
@@ -46,14 +58,6 @@ inotifywait -m -r -e create,close_write,moved_to \
     --excludei "$INOTIFY_EXCLUDE" \
     --format '%w%f' "$TARGET_DIR" 2>/dev/null | while read -r CHANGED_PATH; do
 
-    [ ! -e "$CHANGED_PATH" ] && continue
-
     log "Fixing permissions: $CHANGED_PATH"
-    chown "$OWNER:$GROUP" "$CHANGED_PATH"
-
-    if [ -d "$CHANGED_PATH" ]; then
-        chmod 2775 "$CHANGED_PATH"
-    elif [ -f "$CHANGED_PATH" ]; then
-        chmod 0664 "$CHANGED_PATH"
-    fi
+    fix_path_perms "$CHANGED_PATH"
 done

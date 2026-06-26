@@ -1,7 +1,7 @@
 # {{ ansible_managed }}
 [Unit]
 Description=Real-time perm-watcher for %i web dir (supplements s3-uploads-sync)
-After=network-online.target s3-uploads-sync@%i.service
+After=network-online.target
 
 [Service]
 Type=simple
@@ -13,7 +13,7 @@ CPUWeight=30
 Nice=10
 
 ProtectSystem=strict
-ReadWritePaths={{ web_dir }}
+ReadWritePaths={{ web_dir_readwrite_paths }}
 PrivateTmp=true
 NoNewPrivileges=true
 

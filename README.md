@@ -59,4 +59,4 @@ The role installs templated units and enables instances named after `fqdn`:
 
 ## License
 
-MIT
+Apache 2.0

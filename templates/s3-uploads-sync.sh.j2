@@ -4,8 +4,8 @@
 # S3-event-driven mirror of s3://BUCKET/PREFIX/ -> WEB_DIR.
 # Long-polls SQS for S3 ObjectCreated/ObjectRemoved notifications and
 # applies per-object changes (aws s3 cp / rm). A full-prefix sync runs
-# once at startup only (no --delete). Bursts are coalesced: one receive
-# batch -> parse all keys -> apply -> ack.
+# once at startup only (no --delete). Ownership/modes are enforced by
+# web-perm-watcher via inotify (this script does not chown/chmod).
 set -eo pipefail
 
 : "${UPLOADS_BUCKET:?UPLOADS_BUCKET is required}"
@@ -13,9 +13,6 @@ set -eo pipefail
 : "${UPLOADS_QUEUE_URL:?UPLOADS_QUEUE_URL is required}"
 : "${WEB_DIR:?WEB_DIR is required}"
 : "${AWS_DEFAULT_REGION:?AWS_DEFAULT_REGION is required}"
-
-FILE_OWNER="${FILE_OWNER:-www-data}"
-FILE_GROUP="${FILE_GROUP:-www-data}"
 
 # Paths we never pull from S3 or delete locally (mirrors defaults/main.yml).
 SKIP_PATTERNS=(
@@ -69,17 +66,6 @@ safe_local_path() {
   printf '%s\n' "$resolved"
 }
 
-fix_perms() {
-  local path="$1"
-  [[ -e "$path" ]] || return 0
-  chown "$FILE_OWNER:$FILE_GROUP" "$path"
-  if [[ -d "$path" ]]; then
-    chmod 2775 "$path"
-  else
-    chmod 0664 "$path"
-  fi
-}
-
 apply_create_or_update() {
   local key="$1"
   local rel="${key#${UPLOADS_PREFIX}}"
@@ -99,7 +85,6 @@ apply_create_or_update() {
   mkdir -p "$(dirname "$dest")"
   log "copy: s3://${UPLOADS_BUCKET}/${key} -> ${dest}"
   aws s3 cp "s3://${UPLOADS_BUCKET}/${key}" "$dest"
-  fix_perms "$dest"
 }
 
 apply_delete() {
@@ -131,10 +116,6 @@ run_baseline_sync() {
   aws s3 sync "${SYNC_EXCLUDES[@]}" \
     "s3://${UPLOADS_BUCKET}/${UPLOADS_PREFIX}" \
     "${WEB_DIR}/" 2>&1 | sed 's/^/  /' || return 1
-
-  # Ensure baseline tree ownership (perm-watcher may still be starting)
-  find "$WEB_DIR" -not -path '*/node_modules/*' -not -path '*/vendor/*' \
-    -exec chown "$FILE_OWNER:$FILE_GROUP" {} + 2>/dev/null || true
 }
 
 drain_queue() {

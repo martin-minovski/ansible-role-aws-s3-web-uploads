@@ -4,7 +4,7 @@
 #   developer IDE -> aws s3 cp/sync -> S3 (per-host prefix)
 #   S3 event notification -> SQS queue
 #   on-host daemon long-polls SQS -> mirrors objects into web_dir
-#   inotify perm-watcher fixes ownership/mode for nginx/php-fpm
+#   inotify perm-watcher fixes ownership/mode for nginx/php-fpm (sync does not chown)
 #
 # IAM enforces the upload boundary: the developer policy only permits
 # operations under s3://{{ uploads_bucket }}/{{ uploads_prefix }}
