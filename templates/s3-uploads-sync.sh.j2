@@ -36,17 +36,34 @@ urldecode() {
   python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote_plus(sys.argv[1]))' "$1"
 }
 
+# Sets SKIP_REASON and returns 0 when the key must not be mirrored.
 should_skip_key() {
   local key="$1"
   local rel="$2"
-  local pat
+  local pat stripped
 
-  # Prefix must match our chroot
-  [[ "$key" == "${UPLOADS_PREFIX}"* ]] || return 0
+  SKIP_REASON=""
+
+  # Prefix must match our chroot (shared SQS receives all bucket events).
+  if [[ "$key" != "${UPLOADS_PREFIX}"* ]]; then
+    SKIP_REASON="wrong prefix, want ${UPLOADS_PREFIX}"
+    return 0
+  fi
 
   for pat in "${SKIP_PATTERNS[@]}"; do
-    pat="${pat%\*}"          # "vendor/*" -> "vendor/"
-    [[ "$rel" == "$pat"* ]] && return 0
+    if [[ "${pat: -1}" == '*' ]]; then
+      stripped="${pat%\*}"                 # "vendor/*" -> "vendor/"
+      dir="${stripped%/}"                  # "vendor/" -> "vendor"
+      # Skip the directory itself as well as its contents (.git/* must not
+      # delete local .git when SQS reports the prefix object).
+      if [[ "$rel" != "$dir" && "$rel" != "$dir"/* ]]; then
+        continue
+      fi
+    else
+      [[ "$rel" == "$pat" ]] || continue
+    fi
+    SKIP_REASON="excluded by ${pat}"
+    return 0
   done
   return 1
 }
@@ -72,7 +89,7 @@ apply_create_or_update() {
   rel="${rel#/}"
 
   if should_skip_key "$key" "$rel"; then
-    log "skip (excluded): s3://${UPLOADS_BUCKET}/${key}"
+    log "skip (${SKIP_REASON}): s3://${UPLOADS_BUCKET}/${key}"
     return 0
   fi
 
@@ -93,7 +110,7 @@ apply_delete() {
   rel="${rel#/}"
 
   if should_skip_key "$key" "$rel"; then
-    log "skip delete (excluded): ${key}"
+    log "skip delete (${SKIP_REASON}): ${key}"
     return 0
   fi
 
@@ -103,6 +120,10 @@ apply_delete() {
     return 0
   }
 
+  if [[ -d "$dest" ]]; then
+    log "skip delete (directory, not a file): ${dest}"
+    return 0
+  fi
   if [[ -e "$dest" ]]; then
     log "delete: ${dest}"
     rm -f "$dest"
